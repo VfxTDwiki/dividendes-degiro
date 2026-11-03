@@ -138,7 +138,7 @@ footer .avert { font-size: 1rem; color: var(--muted); white-space: nowrap; }
 
   <section class="outils" aria-label="Fichier">
     <label class="depot" id="depot" for="fichier" tabindex="0">
-      <input type="file" id="fichier" accept=".xlsx,.csv">
+      <input type="file" id="fichier" accept=".xlsx,.xlsm,.xls,.csv,.txt">
       <span class="bouton" data-t="choisir"></span>
       <span data-th="depot"></span>
     </label>
@@ -231,6 +231,7 @@ footer .avert { font-size: 1rem; color: var(--muted); white-space: nowrap; }
     if (v === null || v === undefined || v === "") return 0;
     if (typeof v === "number") return v;
     let s = String(v).trim().replace(/[\s  ]/g, "");
+    s = s.replace(/\u2212/g, "-");
     if (s.indexOf(",") >= 0 && s.indexOf(".") >= 0) s = s.replace(/\./g, "");
     s = s.replace(",", ".");
     const n = parseFloat(s);
@@ -958,63 +959,101 @@ async function dezipper(buf) {
   let p = v.getUint32(e + 16, true);
   const dec = new TextDecoder();
   for (let k = 0; k < nb; k++) {
-    const meth = v.getUint16(p + 10, true), taille = v.getUint32(p + 20, true);
+    if (v.getUint32(p, true) !== 0x02014b50) break;
+    const flags = v.getUint16(p + 8, true), meth = v.getUint16(p + 10, true), taille = v.getUint32(p + 20, true);
     const ln = v.getUint16(p + 28, true), lx = v.getUint16(p + 30, true), lc = v.getUint16(p + 32, true);
-    const loc = v.getUint32(p + 42, true), nom = dec.decode(u8.subarray(p + 46, p + 46 + ln));
-    fichiers[nom] = { meth, taille, loc };
+    const loc = v.getUint32(p + 42, true), nom = dec.decode(u8.subarray(p + 46, p + 46 + ln)).replace(/\\/g, "/");
+    if (flags & 1) throw new Error("le classeur est protégé par un mot de passe");
+    fichiers[nom.toLowerCase()] = { meth, taille, loc };
     p += 46 + ln + lx + lc;
   }
-  return async nom => {
-    const f = fichiers[nom];
+  const lire = async nom => {
+    const f = fichiers[nom.replace(/^\//, "").toLowerCase()];
     if (!f) return null;
     const d = f.loc + 30 + v.getUint16(f.loc + 26, true) + v.getUint16(f.loc + 28, true);
     const brut = u8.subarray(d, d + f.taille);
     if (f.meth === 0) return dec.decode(brut);
+    if (f.meth !== 8) throw new Error("méthode de compression non gérée (" + f.meth + ")");
     const flux = new Blob([brut]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
     return await new Response(flux).text();
   };
+  lire.noms = Object.keys(fichiers);
+  return lire;
 }
-async function lireXlsx(buf) {
-  const lire = await dezipper(buf);
-  const xml = s => new DOMParser().parseFromString(s, "application/xml");
-  // première feuille du classeur
-  let chemin = "xl/worksheets/sheet1.xml";
-  const wb = await lire("xl/workbook.xml"), rels = await lire("xl/_rels/workbook.xml.rels");
-  if (wb && rels) {
-    const s1 = xml(wb).getElementsByTagName("sheet")[0];
-    const rid = s1 && (s1.getAttribute("r:id") || s1.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "id"));
-    for (const r of xml(rels).getElementsByTagName("Relationship"))
-      if (r.getAttribute("Id") === rid) { const t = r.getAttribute("Target"); chemin = t.startsWith("/") ? t.slice(1) : "xl/" + t; }
-  }
-  const partages = [];
-  const ss = await lire("xl/sharedStrings.xml");
-  if (ss) for (const si of xml(ss).getElementsByTagName("si"))
-    partages.push([...si.getElementsByTagName("t")].map(t => t.textContent).join(""));
-  const feuille = await lire(chemin);
-  if (!feuille) throw new Error("feuille introuvable dans le classeur");
-  const col = ref => { let n = 0; for (const ch of ref.replace(/\d+/g, "")) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+/* éléments XML par nom local, quel que soit le préfixe d'espace de noms (x:row, row…) */
+const enfants = (n, nom) => [...n.getElementsByTagNameNS("*", nom)];
+const xmlDoc = s => new DOMParser().parseFromString(s, "application/xml");
+const colIndex = ref => { let n = 0; for (const ch of ref.replace(/[^A-Z]/gi, "").toUpperCase()) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+function lireFeuilleXml(texte, partages) {
   const table = [];
-  for (const row of xml(feuille).getElementsByTagName("row")) {
-    const ligne = [];
-    for (const c of row.getElementsByTagName("c")) {
-      const t = c.getAttribute("t"), vEl = c.getElementsByTagName("v")[0];
+  for (const row of enfants(xmlDoc(texte), "row")) {
+    const ligne = []; let pos = 0;
+    for (const c of enfants(row, "c")) {
+      const r = c.getAttribute("r"), t = c.getAttribute("t"), vEl = enfants(c, "v")[0];
+      const i = r ? colIndex(r) : pos; pos = i + 1;
       let val = null;
-      if (t === "s") val = partages[+vEl.textContent];
-      else if (t === "inlineStr") val = [...c.getElementsByTagName("t")].map(x => x.textContent).join("");
+      if (t === "s") val = vEl ? partages[+vEl.textContent] ?? null : null;
+      else if (t === "inlineStr") val = enfants(c, "t").map(x => x.textContent).join("");
       else if (t === "str" || t === "e") val = vEl ? vEl.textContent : null;
       else if (t === "b") val = vEl ? vEl.textContent === "1" : null;
-      else if (vEl) val = parseFloat(vEl.textContent);
-      ligne[col(c.getAttribute("r"))] = val;
+      else if (vEl && vEl.textContent !== "") { const n = Number(vEl.textContent); val = isNaN(n) ? vEl.textContent : n; }
+      ligne[i] = val;
     }
     for (let i = 0; i < ligne.length; i++) if (ligne[i] === undefined) ligne[i] = null;
-    table[(+row.getAttribute("r") || table.length + 1) - 1] = ligne;
+    const nr = +row.getAttribute("r");
+    if (nr > 0) table[nr - 1] = ligne; else table.push(ligne);
   }
   return table.filter(Boolean);
 }
+/* repère la ligne d'en-têtes du relevé (peut être précédée de lignes de titre) */
+function ligneEntete(table) {
+  for (let r = 0; r < Math.min(table.length, 40); r++) {
+    const h = (table[r] || []).map(x => String(x ?? "").trim().toLowerCase());
+    if (h.includes("description") && (h.includes("date") || h.includes("mouvements") || h.includes("change"))) return r;
+  }
+  return -1;
+}
+async function lireXlsx(buf) {
+  const lire = await dezipper(buf);
+  const partages = [];
+  const ss = await lire("xl/sharedStrings.xml");
+  if (ss) for (const si of enfants(xmlDoc(ss), "si"))
+    partages.push(enfants(si, "t").filter(t => !t.closest || !(t.parentNode && t.parentNode.localName === "rPh")).map(t => t.textContent).join(""));
+  // feuilles dans l'ordre du classeur, puis toutes les autres
+  const chemins = [];
+  const wb = await lire("xl/workbook.xml"), rels = await lire("xl/_rels/workbook.xml.rels");
+  if (wb && rels) {
+    const cibles = {};
+    for (const r of enfants(xmlDoc(rels), "Relationship")) cibles[r.getAttribute("Id")] = r.getAttribute("Target");
+    for (const s of enfants(xmlDoc(wb), "sheet")) {
+      const rid = [...s.attributes].find(a => a.localName === "id" && a.name !== "sheetId");
+      const t = rid && cibles[rid.value];
+      if (t) chemins.push(t.startsWith("/") ? t.slice(1) : "xl/" + t.replace(/^\.\//, ""));
+    }
+  }
+  for (const n of lire.noms) if (/^xl\/worksheets\/[^/]+\.xml$/.test(n) && !chemins.some(c => c.toLowerCase() === n)) chemins.push(n);
+  if (!chemins.length) throw new Error("aucune feuille trouvée dans le classeur");
+  let premiere = null;
+  for (const ch of chemins) {
+    const x = await lire(ch);
+    if (!x) continue;
+    const table = lireFeuilleXml(x, partages);
+    if (!premiere) premiere = table;
+    if (ligneEntete(table) >= 0) return table;
+  }
+  return premiere || [];
+}
+/* ancien format .xls : soit un vrai classeur Excel 97-2003, soit une page HTML renommée */
+function lireHtml(texte) {
+  const doc = new DOMParser().parseFromString(texte, "text/html");
+  const tables = [...doc.querySelectorAll("table")].map(t => [...t.rows].map(r => [...r.cells].map(c => { const s = c.textContent.trim(); return s === "" ? null : s; })));
+  return tables.find(t => ligneEntete(t) >= 0) || tables[0] || [];
+}
 function lireCsv(texte) {
-  texte = texte.replace(/^\ufeff/, "");
-  const premiere = texte.split(/\r?\n/)[0];
-  const sep = (premiere.match(/;/g) || []).length > (premiere.match(/,/g) || []).length ? ";" : ",";
+  texte = texte.replace(/^﻿/, "");
+  const premiere = texte.split(/\r?\n/).find(l => /description/i.test(l)) || texte.split(/\r?\n/)[0];
+  const compte = c => premiere.split(c).length - 1;
+  const sep = [",", ";", "\t"].sort((a, b) => compte(b) - compte(a))[0];
   const lignes = []; let ligne = [], champ = "", guill = false;
   for (let i = 0; i < texte.length; i++) {
     const ch = texte[i];
@@ -1032,13 +1071,34 @@ function lireCsv(texte) {
   if (champ || ligne.length) { ligne.push(champ); lignes.push(ligne); }
   return lignes.map(l => l.map(v => v === "" ? null : v));
 }
-
+function decoderTexte(buf) {
+  const t = new TextDecoder("utf-8").decode(buf);
+  return t.includes("\uFFFD") ? new TextDecoder("windows-1252").decode(buf) : t;
+}
+/* lit n'importe quel export : détecte le format au contenu, pas à l'extension */
+async function lireTable(buf) {
+  const u8 = new Uint8Array(buf);
+  let table;
+  if (u8[0] === 0x50 && u8[1] === 0x4b) table = await lireXlsx(buf);
+  else if (u8[0] === 0xd0 && u8[1] === 0xcf && u8[2] === 0x11 && u8[3] === 0xe0)
+    throw new Error("fichier Excel 97-2003 (.xls) non lisible ici. Ouvrez-le dans Excel et enregistrez-le au format .xlsx, ou exportez le relevé Degiro en .csv");
+  else {
+    const texte = decoderTexte(buf);
+    table = /^\s*</.test(texte) ? lireHtml(texte) : lireCsv(texte);
+  }
+  const r = ligneEntete(table);
+  if (r < 0) {
+    const apercu = (table.find(l => l && l.some(v => v !== null)) || []).filter(v => v !== null).slice(0, 6).join(" | ");
+    throw new Error("en-têtes Date / Description / Mouvements introuvables" + (apercu ? " (première ligne lue : « " + String(apercu).slice(0, 120) + " »)" : " (fichier vide ?)"));
+  }
+  return table.slice(r);
+}
 async function lireFichier(f) {
   $("etat").textContent = t("etatLecture", { f: f.name });
   $("etat").classList.remove("erreur");
   try {
     const buf = await f.arrayBuffer();
-    const table = /\.csv$/i.test(f.name) ? lireCsv(new TextDecoder("utf-8").decode(buf)) : await lireXlsx(buf);
+    const table = await lireTable(buf);
     charger(table, f.name, false);
   } catch (e) {
     $("etat").textContent = t("erreur", { m: motif(e.message) });
